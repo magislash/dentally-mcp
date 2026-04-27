@@ -1,10 +1,11 @@
-import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import http from "http";
 
 const DENTALLY_API = "https://api.dentally.co/v1";
 const DENTALLY_TOKEN = process.env.DENTALLY_API_TOKEN;
+const PORT = process.env.PORT || 3000;
 
 async function dentally(path) {
   const res = await fetch(`${DENTALLY_API}${path}`, {
@@ -21,13 +22,10 @@ function monthRange(year, month) {
   return { after, before: `${year}-${String(month).padStart(2,"0")}-${lastDay}` };
 }
 
-const app = express();
-const transports = {};
-
-app.get("/sse", async (req, res) => {
+function createServer() {
   const server = new McpServer({ name: "dentally-mcp", version: "1.0.0" });
 
-  server.tool("get_patient_debtors", "List all patients who owe money", {}, async () => {
+  server.tool("get_patient_debtors", "List all patients who owe money to the practice", {}, async () => {
     const data = await dentally("/accounts?state=debit&per_page=100");
     const accounts = data.accounts || [];
     if (!accounts.length) return { content: [{ type: "text", text: "No debtors found." }] };
@@ -36,13 +34,13 @@ app.get("/sse", async (req, res) => {
     return { content: [{ type: "text", text: `PATIENT DEBTORS (${accounts.length})\n${rows}\nTOTAL: ${gbp(Math.abs(parseFloat(data.meta?.total_balance||0)))}` }] };
   });
 
-  server.tool("get_received_vs_invoiced", "Compare invoiced vs received", { from_date: z.string(), to_date: z.string() }, async ({ from_date, to_date }) => {
+  server.tool("get_received_vs_invoiced", "Compare invoiced vs received for a date range", { from_date: z.string(), to_date: z.string() }, async ({ from_date, to_date }) => {
     const data = await dentally(`/invoices?dated_on_after=${from_date}&dated_on_before=${to_date}&per_page=100`);
     const invoices = data.invoices || [];
     let totalInvoiced=0, totalOutstanding=0, paid=0, unpaid=0;
     for (const inv of invoices) { totalInvoiced+=parseFloat(inv.amount||0); totalOutstanding+=parseFloat(inv.amount_outstanding||0); inv.paid?paid++:unpaid++; }
     const received = totalInvoiced - totalOutstanding;
-    return { content: [{ type: "text", text: `INVOICED vs RECEIVED\nInvoiced: ${gbp(totalInvoiced)}\nReceived: ${gbp(received)}\nOutstanding: ${gbp(totalOutstanding)}\nRate: ${((received/totalInvoiced)*100).toFixed(1)}%\nPaid: ${paid} Unpaid: ${unpaid}` }] };
+    return { content: [{ type: "text", text: `INVOICED vs RECEIVED\nInvoiced: ${gbp(totalInvoiced)}\nReceived: ${gbp(received)}\nOutstanding: ${gbp(totalOutstanding)}\nRate: ${totalInvoiced>0?((received/totalInvoiced)*100).toFixed(1):0}%\nPaid: ${paid} Unpaid: ${unpaid}` }] };
   });
 
   server.tool("get_revenue_comparison", "Compare revenue across periods", {}, async () => {
@@ -59,19 +57,24 @@ app.get("/sse", async (req, res) => {
     return { content: [{ type: "text", text: `REVENUE COMPARISON\nThis Month: ${gbp(tm)}\nLast Month: ${gbp(lmt)}\nMoM: ${parseFloat(mom)>=0?"📈":"📉"} ${mom}%\nThis Quarter: ${gbp(tq)}\nThis Year: ${gbp(ty)}\nLast Year: ${gbp(ly)}\nYoY: ${parseFloat(yoy)>=0?"📈":"📉"} ${yoy}%` }] };
   });
 
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  await server.connect(transport);
+  return server;
+}
+
+// HTTP server for Render
+const httpServer = http.createServer(async (req, res) => {
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200); res.end("OK"); return;
+  }
+  if (req.method === "POST" && req.url === "/mcp") {
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const server = createServer();
+    await server.connect(transport);
+    await transport.handleRequest(req, res, await new Promise(resolve => {
+      let body = ""; req.on("data", c => body += c); req.on("end", () => resolve(JSON.parse(body)));
+    }));
+    return;
+  }
+  res.writeHead(404); res.end("Not found");
 });
 
-app.post("/messages", express.json(), async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
-  if (transport) await transport.handlePostMessage(req, res);
-  else res.status(404).send("Session not found");
-});
-
-app.get("/", (req, res) => res.send("Dentally MCP Server running ✅"));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Dentally MCP Server running on port ${PORT}`));
+httpServer.listen(PORT, () => console.log(`Dentally MCP server running on port ${PORT} ✅`));
