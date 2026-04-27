@@ -49,7 +49,7 @@ function createServer() {
   const server = new McpServer({ name: "dentally-mcp", version: "2.1.0" });
 
   // 1. Patient Debtors — NOW includes Patient ID + duplicate name flag
-  server.tool("get_patient_debtors", "List patients who owe money. Includes patient ID. Filter by site and/or historical as_at_date.",
+  server.tool("get_patient_debtors", "Get a SNAPSHOT of all patients who owe money at a single point in time. Use as_at_date for a historical snapshot (e.g. end of month). For debtors BETWEEN two dates or changes over a period, use get_new_debtors_in_range instead.",
     { site: z.string().optional().describe("Practice site e.g. 'Dame Street' or 'Bray'"), as_at_date: z.string().optional().describe("Historical date YYYY-MM-DD e.g. '2026-03-31'") },
     async ({ site, as_at_date }) => {
       const params = { state: "debit" };
@@ -212,7 +212,7 @@ function createServer() {
 
   // 11. New Debtors in Date Range — compares two snapshots to find new/worsened debtors
   server.tool("get_new_debtors_in_range",
-    "Find patients who became debtors OR whose balance worsened between two dates. Works by comparing two as_at snapshots.",
+    "Use this when asked for debtors BETWEEN two dates, DURING a period, or OVER a date range (e.g. between 15 April and 20 April). Compares two snapshots to show: new debtors, worsened balances, and cleared accounts in that window.",
     {
       from_date: z.string().describe("Start of window YYYY-MM-DD e.g. '2026-04-20'"),
       to_date: z.string().describe("End of window YYYY-MM-DD e.g. '2026-04-28'"),
