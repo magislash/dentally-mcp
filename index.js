@@ -11,6 +11,10 @@ async function dentallyPage(path) {
   const res = await fetch(`${DENTALLY_API}${path}`, {
     headers: { Authorization: `Bearer ${DENTALLY_TOKEN}`, "Content-Type": "application/json", "User-Agent": "Dentally-MCP-Server v2" },
   });
+  if (res.status === 429) {
+    const retryAfter = res.headers.get('Retry-After') || '60';
+    throw new Error(`🚫 RATE LIMIT HIT — Too many requests. Please wait ${retryAfter} seconds before trying again.`);
+  }
   if (!res.ok) throw new Error(`Dentally API error: ${res.status} ${res.statusText}`);
   return res.json();
 }
@@ -45,6 +49,34 @@ async function resolveSiteId(siteName) {
   return match ? match.id : null;
 }
 
+
+// Check rate limit and warn if low or exhausted
+async function checkRateLimit() {
+  try {
+    const res = await fetch(`${DENTALLY_API.replace('/v1','')}/rate_limit`, {
+      headers: { Authorization: `Bearer ${DENTALLY_TOKEN}`, "User-Agent": "Dentally-MCP-Server v2" }
+    });
+    const data = await res.json();
+    const core = data.resources?.core || {};
+    const { limit = 3600, remaining = 0, reset = 0 } = core;
+    const resetTime = new Date(reset * 1000).toLocaleTimeString("en-IE", { hour: "2-digit", minute: "2-digit" });
+    const pct = Math.round((remaining / limit) * 100);
+
+    if (remaining === 0) {
+      return { ok: false, warning: `🚫 RATE LIMIT EXHAUSTED — 0/${limit} requests remaining. Resets at ${resetTime}. Please wait before running queries.` };
+    }
+    if (remaining < 100) {
+      return { ok: true, warning: `⚠️ Rate limit critical: ${remaining}/${limit} remaining (${pct}%). Resets at ${resetTime}. Avoid heavy queries.` };
+    }
+    if (remaining < 300) {
+      return { ok: true, warning: `⚠️ Rate limit low: ${remaining}/${limit} remaining (${pct}%). Resets at ${resetTime}.` };
+    }
+    return { ok: true, warning: null, remaining, limit };
+  } catch (e) {
+    return { ok: true, warning: null }; // Don't block if rate limit check itself fails
+  }
+}
+
 function createServer() {
   const server = new McpServer({ name: "dentally-mcp", version: "2.1.0" });
 
@@ -52,6 +84,9 @@ function createServer() {
   server.tool("get_patient_debtors", "List patients who owe money. Optionally filter by site (e.g. 'Dame Street'). Site filtering works by looking up each patient's registered site_id — accurate but takes 30-60s for large lists.",
     { site: z.string().optional().describe("Filter by site e.g. 'Dame Street', 'Bray', 'Citywest'") },
     async ({ site }) => {
+      const rl = await checkRateLimit();
+      if (!rl.ok) return { content: [{ type: "text", text: rl.warning }] };
+      if (rl.warning) console.warn(rl.warning);
       const accounts = await dentallyAll("/accounts", { state: "debit" }, "accounts");
       if (!accounts.length) return { content: [{ type: "text", text: "No debtors found." }] };
 
@@ -308,6 +343,34 @@ function createServer() {
         ``,
         `✅ CLEARED (${cleared.length})`,
         clearedRows,
+      ].join("\n") }] };
+    }
+  );
+
+
+  // Rate Limit Status
+  server.tool("get_rate_limit_status", "Check current Dentally API rate limit — how many requests remain and when it resets", {},
+    async () => {
+      const res = await fetch(`${DENTALLY_API.replace('/v1','')}/rate_limit`, {
+        headers: { Authorization: `Bearer ${DENTALLY_TOKEN}`, "User-Agent": "Dentally-MCP-Server v2" }
+      });
+      const data = await res.json();
+      const core = data.resources?.core || {};
+      const sms = data.resources?.sms || {};
+      const resetTime = new Date((core.reset||0)*1000).toLocaleTimeString("en-IE", { hour:"2-digit", minute:"2-digit" });
+      const smsResetTime = new Date((sms.reset||0)*1000).toLocaleTimeString("en-IE", { hour:"2-digit", minute:"2-digit" });
+      const pct = Math.round(((core.remaining||0)/(core.limit||3600))*100);
+      const status = core.remaining === 0 ? "🚫 EXHAUSTED" : core.remaining < 100 ? "🔴 CRITICAL" : core.remaining < 300 ? "🟡 LOW" : "🟢 OK";
+      return { content: [{ type: "text", text: [
+        `DENTALLY API RATE LIMIT`,
+        `${"─".repeat(35)}`,
+        `Status: ${status}`,
+        `Core API: ${core.remaining||0} / ${core.limit||3600} remaining (${pct}%)`,
+        `Resets at: ${resetTime}`,
+        ``,
+        `SMS API: ${sms.remaining||0} / ${sms.limit||300} remaining`,
+        `SMS Resets at: ${smsResetTime}`,
+        ${core.remaining === 0 ? `\`\nAll queries are blocked until reset at ${resetTime}\`` : `""`},
       ].join("\n") }] };
     }
   );
