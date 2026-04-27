@@ -49,23 +49,15 @@ function createServer() {
   const server = new McpServer({ name: "dentally-mcp", version: "2.1.0" });
 
   // 1. Patient Debtors — NOW includes Patient ID + duplicate name flag
-  server.tool("get_patient_debtors", "Get a SNAPSHOT of all patients who owe money at a single point in time. Use as_at_date for a historical snapshot (e.g. end of month). For debtors BETWEEN two dates or changes over a period, use get_new_debtors_in_range instead.",
-    { site: z.string().optional().describe("Practice site e.g. 'Dame Street' or 'Bray'"), as_at_date: z.string().optional().describe("Historical date YYYY-MM-DD e.g. '2026-03-31'") },
-    async ({ site, as_at_date }) => {
-      const params = { state: "debit" };
-      if (as_at_date) params.as_at = as_at_date;
-      if (site) {
-        const siteId = await resolveSiteId(site);
-        if (!siteId) return { content: [{ type: "text", text: `Could not find site "${site}". Use list_sites to see all available sites.` }] };
-        params.site_id = siteId;
-      }
-      const accounts = await dentallyAll("/accounts", params, "accounts");
-      if (!accounts.length) return { content: [{ type: "text", text: `No debtors found${site?" for "+site:""}${as_at_date?" as at "+as_at_date:""}.` }] };
+  server.tool("get_patient_debtors", "Get the FULL GROUP-WIDE list of all patients who currently owe money. NOTE: The Dentally /accounts API does not support site or date filtering — it always returns the entire group debtor book regardless of parameters. For date range movement analysis use get_new_debtors_in_range.",
+    {},
+    async () => {
+      const accounts = await dentallyAll("/accounts", { state: "debit" }, "accounts");
+      if (!accounts.length) return { content: [{ type: "text", text: "No debtors found." }] };
 
       const sorted = accounts.sort((a,b) => parseFloat(b.current_balance)-parseFloat(a.current_balance));
       const total = sorted.reduce((s,a) => s+Math.abs(parseFloat(a.current_balance||0)), 0);
 
-      // Flag duplicate names so Jimmy can identify ambiguous records
       const nameCounts = {};
       for (const a of sorted) nameCounts[a.patient_name] = (nameCounts[a.patient_name]||0)+1;
 
@@ -76,7 +68,18 @@ function createServer() {
 
       const dupCount = Object.values(nameCounts).filter(n => n > 1).reduce((s,n) => s+n, 0);
 
-      return { content: [{ type: "text", text: `PATIENT DEBTORS\nSite: ${site||"All sites"}\nAs at: ${as_at_date||"today ("+today()+")"}\nTotal patients: ${accounts.length}${dupCount>0?" | ⚠️ "+dupCount+" patients have duplicate names":""}\n${"─".repeat(45)}\n${rows}\n${"─".repeat(45)}\nTOTAL OUTSTANDING: ${gbp(total)}` }] };
+      return { content: [{ type: "text", text: [
+        `⚠️ GROUP-WIDE DEBTOR LIST (Dentally API does not support site or date filtering on this endpoint)`,
+        `As at: today (${today()})`,
+        `Total patients: ${accounts.length}${dupCount>0?" | ⚠️ "+dupCount+" patients have duplicate names":""}`,
+        `${"─".repeat(45)}`,
+        rows,
+        `${"─".repeat(45)}`,
+        `TOTAL OUTSTANDING: ${gbp(total)}`,
+        ``,
+        `Note: Per-site breakdowns are not available via the Dentally API /accounts endpoint.`,
+        `For site-level collections, use the Dentally web UI reports or Xero debtors ledger.`,
+      ].join("\n") }] };
     }
   );
 
@@ -212,7 +215,7 @@ function createServer() {
 
   // 11. New Debtors in Date Range — compares two snapshots to find new/worsened debtors
   server.tool("get_new_debtors_in_range",
-    "Use this when asked for debtors BETWEEN two dates, DURING a period, or OVER a date range (e.g. between 15 April and 20 April). Compares two snapshots to show: new debtors, worsened balances, and cleared accounts in that window.",
+    "Compare group-wide debtor snapshots between two dates to find new debtors, worsened balances, and cleared accounts. NOTE: The Dentally API does not support site filtering on /accounts — results are always group-wide. Use when asked for debtor changes BETWEEN two dates or OVER a date range.",
     {
       from_date: z.string().describe("Start of window YYYY-MM-DD e.g. '2026-04-20'"),
       to_date: z.string().describe("End of window YYYY-MM-DD e.g. '2026-04-28'"),
@@ -220,11 +223,7 @@ function createServer() {
     },
     async ({ from_date, to_date, site }) => {
       const params = { state: "debit" };
-      if (site) {
-        const siteId = await resolveSiteId(site);
-        if (!siteId) return { content: [{ type: "text", text: `Could not find site "${site}".` }] };
-        params.site_id = siteId;
-      }
+      // NOTE: site_id filter not supported by Dentally /accounts API — always returns group-wide
 
       // Fetch both snapshots in parallel
       const [startAccounts, endAccounts] = await Promise.all([
