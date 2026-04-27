@@ -49,36 +49,52 @@ function createServer() {
   const server = new McpServer({ name: "dentally-mcp", version: "2.1.0" });
 
   // 1. Patient Debtors — NOW includes Patient ID + duplicate name flag
-  server.tool("get_patient_debtors", "Get the FULL GROUP-WIDE list of all patients who currently owe money. NOTE: The Dentally /accounts API does not support site or date filtering — it always returns the entire group debtor book regardless of parameters. For date range movement analysis use get_new_debtors_in_range.",
-    {},
-    async () => {
+  server.tool("get_patient_debtors", "List patients who owe money. Optionally filter by site (e.g. 'Dame Street'). Site filtering works by looking up each patient's registered site_id — accurate but takes 30-60s for large lists.",
+    { site: z.string().optional().describe("Filter by site e.g. 'Dame Street', 'Bray', 'Citywest'") },
+    async ({ site }) => {
       const accounts = await dentallyAll("/accounts", { state: "debit" }, "accounts");
       if (!accounts.length) return { content: [{ type: "text", text: "No debtors found." }] };
 
-      const sorted = accounts.sort((a,b) => parseFloat(b.current_balance)-parseFloat(a.current_balance));
-      const total = sorted.reduce((s,a) => s+Math.abs(parseFloat(a.current_balance||0)), 0);
+      let filtered = accounts;
 
+      if (site) {
+        const siteId = await resolveSiteId(site);
+        if (!siteId) return { content: [{ type: "text", text: `Could not find site "${site}". Use list_sites to see available sites.` }] };
+        const BATCH = 10;
+        const withSite = [];
+        for (let i = 0; i < accounts.length; i += BATCH) {
+          const batch = accounts.slice(i, i + BATCH);
+          const results = await Promise.all(batch.map(async (a) => {
+            try {
+              const data = await dentallyPage(`/patients/${a.patient_id||a.id}`);
+              return data.patient?.site_id === siteId ? a : null;
+            } catch { return null; }
+          }));
+          withSite.push(...results.filter(Boolean));
+        }
+        filtered = withSite;
+      }
+
+      if (!filtered.length) return { content: [{ type: "text", text: `No debtors found${site?" for "+site:""}.` }] };
+
+      const sorted = filtered.sort((a,b) => parseFloat(b.current_balance)-parseFloat(a.current_balance));
+      const total = sorted.reduce((s,a) => s+Math.abs(parseFloat(a.current_balance||0)), 0);
       const nameCounts = {};
       for (const a of sorted) nameCounts[a.patient_name] = (nameCounts[a.patient_name]||0)+1;
-
       const rows = sorted.map((a,i) => {
         const dup = nameCounts[a.patient_name] > 1 ? " ⚠️ DUPLICATE NAME" : "";
         return `${i+1}. [ID: ${a.patient_id||a.id||"N/A"}] ${a.patient_name} — owes ${gbp(Math.abs(a.current_balance))}${dup}`;
       }).join("\n");
-
       const dupCount = Object.values(nameCounts).filter(n => n > 1).reduce((s,n) => s+n, 0);
-
       return { content: [{ type: "text", text: [
-        `⚠️ GROUP-WIDE DEBTOR LIST (Dentally API does not support site or date filtering on this endpoint)`,
+        `PATIENT DEBTORS`,
+        `Site: ${site||"All sites (group-wide)"}`,
         `As at: today (${today()})`,
-        `Total patients: ${accounts.length}${dupCount>0?" | ⚠️ "+dupCount+" patients have duplicate names":""}`,
+        `Total: ${sorted.length} patients${dupCount>0?" | ⚠️ "+dupCount+" duplicate names":""}`,
         `${"─".repeat(45)}`,
         rows,
         `${"─".repeat(45)}`,
         `TOTAL OUTSTANDING: ${gbp(total)}`,
-        ``,
-        `Note: Per-site breakdowns are not available via the Dentally API /accounts endpoint.`,
-        `For site-level collections, use the Dentally web UI reports or Xero debtors ledger.`,
       ].join("\n") }] };
     }
   );
