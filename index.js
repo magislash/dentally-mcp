@@ -30,7 +30,7 @@ async function dentallyAll(endpoint, params = {}, key) {
   return allItems;
 }
 
-function gbp(val) { return `£${parseFloat(val || 0).toFixed(2)}`; }
+function gbp(val) { return `€${parseFloat(val || 0).toFixed(2)}`; }
 function today() { return new Date().toISOString().split("T")[0]; }
 function monthStart() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`; }
 function weekStart() { const d = new Date(); d.setDate(d.getDate()-d.getDay()); return d.toISOString().split("T")[0]; }
