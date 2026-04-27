@@ -209,6 +209,94 @@ function createServer() {
     }
   );
 
+
+  // 11. New Debtors in Date Range — compares two snapshots to find new/worsened debtors
+  server.tool("get_new_debtors_in_range",
+    "Find patients who became debtors OR whose balance worsened between two dates. Works by comparing two as_at snapshots.",
+    {
+      from_date: z.string().describe("Start of window YYYY-MM-DD e.g. '2026-04-20'"),
+      to_date: z.string().describe("End of window YYYY-MM-DD e.g. '2026-04-28'"),
+      site: z.string().optional().describe("Practice site e.g. 'Dame Street'"),
+    },
+    async ({ from_date, to_date, site }) => {
+      const params = { state: "debit" };
+      if (site) {
+        const siteId = await resolveSiteId(site);
+        if (!siteId) return { content: [{ type: "text", text: `Could not find site "${site}".` }] };
+        params.site_id = siteId;
+      }
+
+      // Fetch both snapshots in parallel
+      const [startAccounts, endAccounts] = await Promise.all([
+        dentallyAll("/accounts", { ...params, as_at: from_date }, "accounts"),
+        dentallyAll("/accounts", { ...params, as_at: to_date }, "accounts"),
+      ]);
+
+      // Build lookup maps by patient_id
+      const startMap = {};
+      for (const a of startAccounts) startMap[a.patient_id || a.id] = parseFloat(a.current_balance || 0);
+
+      const endMap = {};
+      for (const a of endAccounts) endMap[a.patient_id || a.id] = a;
+
+      const newDebtors = [];
+      const worsenedDebtors = [];
+
+      for (const a of endAccounts) {
+        const pid = a.patient_id || a.id;
+        const endBal = Math.abs(parseFloat(a.current_balance || 0));
+        if (!(pid in startMap)) {
+          // Didn't exist as debtor at start — brand new debtor
+          newDebtors.push({ name: a.patient_name, id: pid, balance: endBal });
+        } else {
+          const startBal = Math.abs(startMap[pid]);
+          if (endBal > startBal + 0.01) {
+            // Balance got worse
+            worsenedDebtors.push({ name: a.patient_name, id: pid, before: startBal, after: endBal, increase: endBal - startBal });
+          }
+        }
+      }
+
+      // Also find debtors who cleared their balance (were debtors at start, gone by end)
+      const cleared = startAccounts.filter(a => {
+        const pid = a.patient_id || a.id;
+        return !(pid in endMap);
+      });
+
+      newDebtors.sort((a,b) => b.balance - a.balance);
+      worsenedDebtors.sort((a,b) => b.increase - a.increase);
+
+      const newRows = newDebtors.length
+        ? newDebtors.map((d,i) => `${i+1}. [ID: ${d.id}] ${d.name} — ${gbp(d.balance)}`).join("\n")
+        : "None";
+
+      const worsenedRows = worsenedDebtors.length
+        ? worsenedDebtors.map((d,i) => `${i+1}. [ID: ${d.id}] ${d.name} — ${gbp(d.before)} → ${gbp(d.after)} (+${gbp(d.increase)})`).join("\n")
+        : "None";
+
+      const clearedRows = cleared.length
+        ? cleared.map((a,i) => `${i+1}. [ID: ${a.patient_id||a.id}] ${a.patient_name} — cleared ${gbp(Math.abs(parseFloat(a.current_balance||0)))}`).join("\n")
+        : "None";
+
+      const totalNewDebt = newDebtors.reduce((s,d) => s+d.balance, 0);
+      const totalWorsened = worsenedDebtors.reduce((s,d) => s+d.increase, 0);
+
+      return { content: [{ type: "text", text: [
+        `DEBTOR CHANGES: ${from_date} → ${to_date}`,
+        `Site: ${site||"All sites"}`,
+        `${"─".repeat(45)}`,
+        `🆕 NEW DEBTORS (${newDebtors.length}) — Total: ${gbp(totalNewDebt)}`,
+        newRows,
+        ``,
+        `📈 WORSENED (${worsenedDebtors.length}) — Additional: ${gbp(totalWorsened)}`,
+        worsenedRows,
+        ``,
+        `✅ CLEARED (${cleared.length})`,
+        clearedRows,
+      ].join("\n") }] };
+    }
+  );
+
   return server;
 }
 
