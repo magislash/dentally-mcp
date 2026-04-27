@@ -15,7 +15,6 @@ async function dentallyPage(path) {
   return res.json();
 }
 
-// Fetch ALL pages automatically - no more 100 record cap!
 async function dentallyAll(endpoint, params = {}, key) {
   let page = 1, allItems = [];
   while (true) {
@@ -38,36 +37,46 @@ function weekStart() { const d = new Date(); d.setDate(d.getDate()-d.getDay()); 
 function monthRange(year, month) {
   return { after: `${year}-${String(month).padStart(2,"0")}-01`, before: `${year}-${String(month).padStart(2,"0")}-${new Date(year,month,0).getDate()}` };
 }
-
-// Resolve "Dame Street" → site_id automatically
 async function resolveSiteId(siteName) {
   if (!siteName) return null;
   const data = await dentallyPage("/sites");
   const sites = data.sites || [];
-  const match = sites.find(s => s.name?.toLowerCase().includes(siteName.toLowerCase()));
+  const match = sites.find(s => s.name?.toLowerCase().includes(siteName.toLowerCase()) || s.nickname?.toLowerCase().includes(siteName.toLowerCase()));
   return match ? match.id : null;
 }
 
 function createServer() {
-  const server = new McpServer({ name: "dentally-mcp", version: "2.0.0" });
+  const server = new McpServer({ name: "dentally-mcp", version: "2.1.0" });
 
-  // 1. Patient Debtors — NOW with site + as_at_date + full pagination
-  server.tool("get_patient_debtors", "List patients who owe money. Filter by site name and/or historical as_at_date.",
-    { site: z.string().optional().describe("Practice site e.g. 'Dame Street'"), as_at_date: z.string().optional().describe("Historical date YYYY-MM-DD e.g. '2026-03-31'") },
+  // 1. Patient Debtors — NOW includes Patient ID + duplicate name flag
+  server.tool("get_patient_debtors", "List patients who owe money. Includes patient ID. Filter by site and/or historical as_at_date.",
+    { site: z.string().optional().describe("Practice site e.g. 'Dame Street' or 'Bray'"), as_at_date: z.string().optional().describe("Historical date YYYY-MM-DD e.g. '2026-03-31'") },
     async ({ site, as_at_date }) => {
       const params = { state: "debit" };
       if (as_at_date) params.as_at = as_at_date;
       if (site) {
         const siteId = await resolveSiteId(site);
-        if (!siteId) return { content: [{ type: "text", text: `❌ Could not find site "${site}". Use list_sites to see all available sites.` }] };
+        if (!siteId) return { content: [{ type: "text", text: `Could not find site "${site}". Use list_sites to see all available sites.` }] };
         params.site_id = siteId;
       }
       const accounts = await dentallyAll("/accounts", params, "accounts");
       if (!accounts.length) return { content: [{ type: "text", text: `No debtors found${site?" for "+site:""}${as_at_date?" as at "+as_at_date:""}.` }] };
+
       const sorted = accounts.sort((a,b) => parseFloat(b.current_balance)-parseFloat(a.current_balance));
       const total = sorted.reduce((s,a) => s+Math.abs(parseFloat(a.current_balance||0)), 0);
-      const rows = sorted.map((a,i) => `${i+1}. ${a.patient_name} — owes ${gbp(Math.abs(a.current_balance))}`).join("\n");
-      return { content: [{ type: "text", text: `PATIENT DEBTORS\nSite: ${site||"All sites"}\nAs at: ${as_at_date||"today ("+today()+")"}\nTotal patients: ${accounts.length}\n${"─".repeat(40)}\n${rows}\n${"─".repeat(40)}\nTOTAL OUTSTANDING: ${gbp(total)}` }] };
+
+      // Flag duplicate names so Jimmy can identify ambiguous records
+      const nameCounts = {};
+      for (const a of sorted) nameCounts[a.patient_name] = (nameCounts[a.patient_name]||0)+1;
+
+      const rows = sorted.map((a,i) => {
+        const dup = nameCounts[a.patient_name] > 1 ? " ⚠️ DUPLICATE NAME" : "";
+        return `${i+1}. [ID: ${a.patient_id||a.id||"N/A"}] ${a.patient_name} — owes ${gbp(Math.abs(a.current_balance))}${dup}`;
+      }).join("\n");
+
+      const dupCount = Object.values(nameCounts).filter(n => n > 1).reduce((s,n) => s+n, 0);
+
+      return { content: [{ type: "text", text: `PATIENT DEBTORS\nSite: ${site||"All sites"}\nAs at: ${as_at_date||"today ("+today()+")"}\nTotal patients: ${accounts.length}${dupCount>0?" | ⚠️ "+dupCount+" patients have duplicate names":""}\n${"─".repeat(45)}\n${rows}\n${"─".repeat(45)}\nTOTAL OUTSTANDING: ${gbp(total)}` }] };
     }
   );
 
@@ -76,12 +85,12 @@ function createServer() {
     { from_date: z.string(), to_date: z.string(), site: z.string().optional() },
     async ({ from_date, to_date, site }) => {
       const params = { dated_on_after: from_date, dated_on_before: to_date };
-      if (site) { const id = await resolveSiteId(site); if (!id) return { content: [{ type: "text", text: `❌ Site "${site}" not found.` }] }; params.site_id = id; }
+      if (site) { const id=await resolveSiteId(site); if (!id) return { content: [{ type: "text", text: `Site "${site}" not found.` }] }; params.site_id=id; }
       const invoices = await dentallyAll("/invoices", params, "invoices");
       let inv=0, out=0, paid=0, unpaid=0;
       for (const i of invoices) { inv+=parseFloat(i.amount||0); out+=parseFloat(i.amount_outstanding||0); i.paid?paid++:unpaid++; }
-      const rec = inv-out;
-      return { content: [{ type: "text", text: `INVOICED vs RECEIVED\nSite: ${site||"All sites"}\nPeriod: ${from_date} → ${to_date}\n${"─".repeat(40)}\nTotal Invoiced:    ${gbp(inv)}\nTotal Received:    ${gbp(rec)}\nStill Outstanding: ${gbp(out)}\n${"─".repeat(40)}\nCollection Rate:   ${inv>0?((rec/inv)*100).toFixed(1):0}%\nPaid: ${paid}  Unpaid: ${unpaid}  Total: ${invoices.length}` }] };
+      const rec=inv-out;
+      return { content: [{ type: "text", text: `INVOICED vs RECEIVED\nSite: ${site||"All sites"}\nPeriod: ${from_date} to ${to_date}\n${"─".repeat(40)}\nTotal Invoiced:    ${gbp(inv)}\nTotal Received:    ${gbp(rec)}\nStill Outstanding: ${gbp(out)}\n${"─".repeat(40)}\nCollection Rate:   ${inv>0?((rec/inv)*100).toFixed(1):0}%\nPaid: ${paid}  Unpaid: ${unpaid}  Total: ${invoices.length}` }] };
     }
   );
 
@@ -89,11 +98,11 @@ function createServer() {
   server.tool("get_revenue_comparison", "Compare revenue this month vs last month, quarter, year. Filter by site.",
     { site: z.string().optional() },
     async ({ site }) => {
-      const now = new Date(); const y=now.getFullYear(); const m=now.getMonth()+1;
+      const now=new Date(); const y=now.getFullYear(); const m=now.getMonth()+1;
       const todayStr=today(); const lm=m===1?12:m-1; const lmy=m===1?y-1:y;
       const {after:lmA,before:lmB}=monthRange(lmy,lm); const qs=Math.floor((m-1)/3)*3+1;
       let sp={};
-      if (site) { const id=await resolveSiteId(site); if (!id) return { content: [{ type: "text", text: `❌ Site "${site}" not found.` }] }; sp.site_id=id; }
+      if (site) { const id=await resolveSiteId(site); if (!id) return { content: [{ type: "text", text: `Site "${site}" not found.` }] }; sp.site_id=id; }
       async function sum(a,b) { const items=await dentallyAll("/invoices",{...sp,dated_on_after:a,dated_on_before:b},"invoices"); return items.reduce((s,i)=>s+parseFloat(i.amount||0),0); }
       const [tm,lmt,tq,ty,ly]=await Promise.all([sum(`${y}-${String(m).padStart(2,"0")}-01`,todayStr),sum(lmA,lmB),sum(`${y}-${String(qs).padStart(2,"0")}-01`,todayStr),sum(`${y}-01-01`,todayStr),sum(`${y-1}-01-01`,`${y-1}-12-31`)]);
       const mom=lmt>0?(((tm-lmt)/lmt)*100).toFixed(1):"N/A"; const yoy=ly>0?(((ty-ly)/ly)*100).toFixed(1):"N/A";
@@ -102,7 +111,7 @@ function createServer() {
   );
 
   // 4. Appointment Overview
-  server.tool("get_appointment_overview", "Appointments today/this week: totals, no-shows, cancellations. Filter by site.",
+  server.tool("get_appointment_overview", "Appointments today/this week with no-shows and cancellations. Filter by site.",
     { period: z.enum(["today","week"]).optional(), site: z.string().optional() },
     async ({ period="today", site }) => {
       const params={after:period==="week"?weekStart():today(),before:today()};
@@ -157,7 +166,7 @@ function createServer() {
       if (!Object.keys(byP).length) return { content: [{ type: "text", text: `No data for ${after} to ${before}.` }] };
       const rows=Object.entries(byP).sort((a,b)=>b[1]-a[1]).map(([id,v],i)=>`${i+1}. Practitioner #${id}: ${gbp(v)}`).join("\n");
       const total=Object.values(byP).reduce((s,v)=>s+v,0);
-      return { content: [{ type: "text", text: `PRACTITIONER PERFORMANCE\nSite: ${site||"All sites"}\nPeriod: ${after} → ${before}\n${"─".repeat(35)}\n${rows}\n${"─".repeat(35)}\nTOTAL: ${gbp(total)}` }] };
+      return { content: [{ type: "text", text: `PRACTITIONER PERFORMANCE\nSite: ${site||"All sites"}\nPeriod: ${after} to ${before}\n${"─".repeat(35)}\n${rows}\n${"─".repeat(35)}\nTOTAL: ${gbp(total)}` }] };
     }
   );
 
@@ -170,7 +179,7 @@ function createServer() {
       const todayStr=today();
       const overdue=patients.filter(p=>(p.dentist_recall_date&&p.dentist_recall_date<todayStr)||(p.hygienist_recall_date&&p.hygienist_recall_date<todayStr));
       if (!overdue.length) return { content: [{ type: "text", text: "No patients overdue for recall." }] };
-      const rows=overdue.slice(0,50).map((p,i)=>{ const parts=[]; if (p.dentist_recall_date<todayStr) parts.push(`Dentist: ${p.dentist_recall_date}`); if (p.hygienist_recall_date<todayStr) parts.push(`Hygienist: ${p.hygienist_recall_date}`); return `${i+1}. ${p.first_name} ${p.last_name} — ${parts.join(", ")}`; }).join("\n");
+      const rows=overdue.slice(0,50).map((p,i)=>{ const parts=[]; if (p.dentist_recall_date&&p.dentist_recall_date<todayStr) parts.push(`Dentist: ${p.dentist_recall_date}`); if (p.hygienist_recall_date&&p.hygienist_recall_date<todayStr) parts.push(`Hygienist: ${p.hygienist_recall_date}`); return `${i+1}. [ID: ${p.id||"N/A"}] ${p.first_name} ${p.last_name} — ${parts.join(", ")}`; }).join("\n");
       return { content: [{ type: "text", text: `OVERDUE RECALLS (${overdue.length})\nSite: ${site||"All sites"}\n${"─".repeat(35)}\n${rows}${overdue.length>50?"\n...and "+(overdue.length-50)+" more":""}` }] };
     }
   );
@@ -185,18 +194,18 @@ function createServer() {
       const params={}; if (site) { const id=await resolveSiteId(site); if (id) params.site_id=id; }
       const [tm,lm2]=await Promise.all([dentallyAll("/patients",{...params,created_after:start},"patients"),dentallyAll("/patients",{...params,created_after:lmA,created_before:lmB},"patients")]);
       const change=lm2.length>0?(((tm.length-lm2.length)/lm2.length)*100).toFixed(1):"N/A";
-      const recent=tm.slice(0,5).map((p,i)=>`${i+1}. ${p.first_name} ${p.last_name} — joined ${p.created_at?.split("T")[0]}`).join("\n");
+      const recent=tm.slice(0,5).map((p,i)=>`${i+1}. [ID: ${p.id||"N/A"}] ${p.first_name} ${p.last_name} — joined ${p.created_at?.split("T")[0]}`).join("\n");
       return { content: [{ type: "text", text: `NEW PATIENTS\nSite: ${site||"All sites"}\n${"─".repeat(35)}\nThis month: ${tm.length}\nLast month: ${lm2.length}\nGrowth: ${parseFloat(change)>=0?"📈":"📉"} ${change}%\n${"─".repeat(35)}\nMost Recent:\n${recent}` }] };
     }
   );
 
-  // 10. List Sites — so Jimmy can see exact site names
+  // 10. List Sites
   server.tool("list_sites", "List all practice sites/locations in Dentally", {},
     async () => {
       const data=await dentallyPage("/sites");
       const sites=data.sites||[];
       if (!sites.length) return { content: [{ type: "text", text: "No sites found." }] };
-      return { content: [{ type: "text", text: `AVAILABLE SITES (${sites.length})\n${"─".repeat(35)}\n${sites.map((s,i)=>`${i+1}. ${s.name} (ID: ${s.id})`).join("\n")}` }] };
+      return { content: [{ type: "text", text: `AVAILABLE SITES (${sites.length})\n${"─".repeat(35)}\n${sites.map((s,i)=>`${i+1}. ${s.name} (nickname: "${s.nickname}") — ID: ${s.id}`).join("\n")}` }] };
     }
   );
 
@@ -216,4 +225,4 @@ const httpServer = http.createServer(async (req, res) => {
   res.writeHead(404); res.end("Not found");
 });
 
-httpServer.listen(PORT, () => console.log(`Dentally MCP server v2.0 running on port ${PORT} ✅`));
+httpServer.listen(PORT, () => console.log(`Dentally MCP server v2.1 running on port ${PORT} ✅`));
