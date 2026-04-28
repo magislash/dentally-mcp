@@ -270,6 +270,73 @@ function createServer() {
     return{content:[{type:"text",text:lines.join("\n")}]};
   });
 
+
+  // Cross-reference debtors by treatment period
+  server.tool(
+    "get_debtors_by_treatment_period",
+    "Cross-reference debtors against invoice activity in a date period. mode=include: debtors WHO HAD treatments in the period (e.g. March debtors). mode=exclude: debtors with NO activity in that period (old debts predating the window). Identifies debtors by matching patient IDs across accounts and invoices. Fast - no per-patient API calls.",
+    {
+      from_date: z.string().describe("Start of period YYYY-MM-DD e.g. 2026-03-01"),
+      to_date: z.string().describe("End of period YYYY-MM-DD e.g. 2026-03-31"),
+      mode: z.enum(["include","exclude"]).describe("include=debtors WITH invoices in this period. exclude=debtors with NO invoices in this period."),
+      site: z.string().optional().describe("Filter invoices by site e.g. Dame Street"),
+    },
+    async ({ from_date, to_date, mode, site }) => {
+      const rl = await checkRateLimit();
+      if (!rl.ok) return { content: [{ type: "text", text: rl.warning }] };
+
+      // Step 1: All debtors (fast bulk call)
+      const accounts = await dentallyAll("/accounts", { state: "debit" }, "accounts");
+      if (!accounts.length) return { content: [{ type: "text", text: "No debtors found." }] };
+
+      // Step 2: All invoices in the date period (fast - date filter supported)
+      const invoiceParams = { dated_on_after: from_date, dated_on_before: to_date };
+      if (site) {
+        const siteId = await resolveSiteId(site);
+        if (!siteId) return { content: [{ type: "text", text: `Could not find site "${site}". Use list_sites to see available sites.` }] };
+        invoiceParams.site_id = siteId;
+      }
+      const invoices = await dentallyAll("/invoices", invoiceParams, "invoices");
+
+      // Step 3: Build set of patient IDs active in this period
+      const activeIds = new Set(invoices.map(inv => inv.patient_id).filter(Boolean));
+
+      // Step 4: Filter debtors by cross-referencing patient IDs
+      const filtered = mode === "include"
+        ? accounts.filter(a => activeIds.has(a.patient_id || a.id))
+        : accounts.filter(a => !activeIds.has(a.patient_id || a.id));
+
+      if (!filtered.length) return { content: [{ type: "text", text: `No debtors matched for ${mode} mode in ${from_date} to ${to_date}.` }] };
+
+      const sorted = filtered.sort((a,b) => parseFloat(b.current_balance)-parseFloat(a.current_balance));
+      const total = sorted.reduce((s,a) => s+Math.abs(parseFloat(a.current_balance||0)), 0);
+      const nc = {}; for (const a of sorted) nc[a.patient_name]=(nc[a.patient_name]||0)+1;
+      const rows = sorted.map((a,i) => {
+        const dup = nc[a.patient_name]>1?" ⚠️ DUPLICATE":"";
+        return `${i+1}. [ID: ${a.patient_id||a.id||"N/A"}] ${a.patient_name} — owes ${eur(Math.abs(a.current_balance))}${dup}`;
+      }).join("\n");
+      const dc = Object.values(nc).filter(n=>n>1).reduce((s,n)=>s+n,0);
+      const modeLabel = mode==="include"
+        ? `🟢 INCLUDE — debtors WITH activity in ${from_date} → ${to_date}`
+        : `🟡 EXCLUDE — debtors with NO activity in ${from_date} → ${to_date} (older debts only)`;
+      const lines = [
+        `DEBTORS BY TREATMENT PERIOD`,
+        modeLabel,
+        `Site invoices: ${site||"All sites"}`,
+        `Invoices found: ${invoices.length} from ${activeIds.size} unique patients`,
+        `${"─".repeat(50)}`,
+        `Matched debtors: ${sorted.length}${dc>0?` | ⚠️ ${dc} duplicate names`:""}`,
+        `${"─".repeat(50)}`,
+        rows,
+        `${"─".repeat(50)}`,
+        `TOTAL OUTSTANDING: ${eur(total)}`,
+      ];
+      if (rl.warning) lines.unshift(rl.warning,"");
+      lines.push(rlFooter(rl));
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
   return server;
 }
 
