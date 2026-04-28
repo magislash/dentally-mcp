@@ -5,16 +5,38 @@ import http from "http";
 
 const DENTALLY_API = "https://api.dentally.co/v1";
 const DENTALLY_RATE_URL = "https://api.dentally.co/rate_limit";
-const DENTALLY_TOKEN = process.env.DENTALLY_API_TOKEN;
 const PORT = process.env.PORT || 3000;
 
+// Dual token support — rotates between Token A and Token B to double rate limit
+const TOKENS = [
+  process.env.DENTALLY_API_TOKEN,
+  process.env.DENTALLY_API_TOKEN_2,
+].filter(Boolean); // Ignore if Token 2 not set
+
+let tokenIndex = 0;
+function getNextToken() {
+  const t = TOKENS[tokenIndex % TOKENS.length];
+  tokenIndex++;
+  return t;
+}
+
 async function dentallyPage(path) {
+  const activeToken = getNextToken();
   const res = await fetch(`${DENTALLY_API}${path}`, {
-    headers: { Authorization: `Bearer ${DENTALLY_TOKEN}`, "Content-Type": "application/json", "User-Agent": "Dentally-MCP-Server v3" },
+    headers: { Authorization: `Bearer ${activeToken}`, "Content-Type": "application/json", "User-Agent": "Dentally-MCP-Server v3" },
   });
   if (res.status === 429) {
+    // Current token exhausted — try the other one if available
+    if (TOKENS.length > 1) {
+      const fallbackToken = getNextToken();
+      const res2 = await fetch(`${DENTALLY_API}${path}`, {
+        headers: { Authorization: `Bearer ${fallbackToken}`, "Content-Type": "application/json", "User-Agent": "Dentally-MCP-Server v3" },
+      });
+      if (!res2.ok) throw new Error(`Dentally API error: ${res2.status} ${res2.statusText}`);
+      return res2.json();
+    }
     const retry = res.headers.get("Retry-After") || "60";
-    throw new Error(`🚫 RATE LIMIT HIT — Too many requests. Please wait ${retry} seconds before trying again.`);
+    throw new Error(`🚫 RATE LIMIT HIT — Both tokens exhausted. Please wait ${retry} seconds.`);
   }
   if (!res.ok) throw new Error(`Dentally API error: ${res.status} ${res.statusText}`);
   return res.json();
@@ -37,19 +59,30 @@ async function dentallyAll(endpoint, params = {}, key) {
 
 async function checkRateLimit() {
   try {
-    const res = await fetch(DENTALLY_RATE_URL, {
-      headers: { Authorization: `Bearer ${DENTALLY_TOKEN}`, "User-Agent": "Dentally-MCP-Server v3" },
-    });
-    const data = await res.json();
-    const core = data.resources?.core || {};
-    const { limit = 3600, remaining = 0, reset = 0 } = core;
-    const resetTime = new Date(reset * 1000).toLocaleTimeString("en-IE", { hour: "2-digit", minute: "2-digit" });
-    const pct = Math.round((remaining / limit) * 100);
-    if (remaining === 0) return { ok: false, warning: `🚫 RATE LIMIT EXHAUSTED — 0/${limit} requests remaining. Resets at ${resetTime}. Please wait before running any queries.` };
-    if (remaining < 100) return { ok: true, warning: `⚠️ Rate limit CRITICAL: ${remaining}/${limit} remaining (${pct}%). Resets at ${resetTime}. Avoid heavy queries.` };
-    if (remaining < 300) return { ok: true, warning: `⚠️ Rate limit LOW: ${remaining}/${limit} remaining (${pct}%). Resets at ${resetTime}.` };
-    const resetTime2 = new Date(reset * 1000).toLocaleTimeString("en-IE", { hour: "2-digit", minute: "2-digit" });
-    return { ok: true, warning: null, remaining, limit, footer: `🟢 API: ${remaining}/${limit} requests left (resets ${resetTime2})` };
+    // Check all tokens and combine remaining
+    const results = await Promise.all(TOKENS.map(async (t, i) => {
+      try {
+        const res = await fetch(DENTALLY_RATE_URL, {
+          headers: { Authorization: `Bearer ${t}`, "User-Agent": "Dentally-MCP-Server v3" },
+        });
+        const data = await res.json();
+        const core = data.resources?.core || {};
+        return { token: i+1, remaining: core.remaining || 0, limit: core.limit || 3600, reset: core.reset || 0 };
+      } catch { return { token: i+1, remaining: 0, limit: 3600, reset: 0 }; }
+    }));
+
+    const totalRemaining = results.reduce((s, r) => s + r.remaining, 0);
+    const totalLimit = results.reduce((s, r) => s + r.limit, 0);
+    const earliestReset = Math.min(...results.map(r => r.reset));
+    const resetTime = new Date(earliestReset * 1000).toLocaleTimeString("en-IE", { hour: "2-digit", minute: "2-digit" });
+    const pct = Math.round((totalRemaining / totalLimit) * 100);
+
+    const tokenBreakdown = results.map(r => `Token ${r.token}: ${r.remaining}/${r.limit}`).join(" | ");
+
+    if (totalRemaining === 0) return { ok: false, warning: `🚫 ALL TOKENS EXHAUSTED — 0/${totalLimit} requests remaining. Resets at ${resetTime}. Please wait.` };
+    if (totalRemaining < 200) return { ok: true, warning: `⚠️ Rate limit CRITICAL: ${totalRemaining}/${totalLimit} remaining (${pct}%). ${tokenBreakdown}. Resets at ${resetTime}.` };
+    if (totalRemaining < 600) return { ok: true, warning: `⚠️ Rate limit LOW: ${totalRemaining}/${totalLimit} remaining (${pct}%). ${tokenBreakdown}` };
+    return { ok: true, warning: null, remaining: totalRemaining, limit: totalLimit, footer: `🟢 API: ${totalRemaining}/${totalLimit} requests left (resets ${resetTime}) [${tokenBreakdown}]` };
   } catch { return { ok: true, warning: null }; }
 }
 
@@ -79,16 +112,21 @@ function createServer() {
   const server = new McpServer({ name: "dentally-mcp", version: "3.0.0" });
 
   server.tool("get_rate_limit_status", "Check Dentally API rate limit status. Run this first if queries are failing.", {}, async () => {
-    const res = await fetch(DENTALLY_RATE_URL, { headers: { Authorization: `Bearer ${DENTALLY_TOKEN}`, "User-Agent": "Dentally-MCP-Server v3" } });
-    const data = await res.json();
-    const core = data.resources?.core || {};
-    const sms = data.resources?.sms || {};
-    const rt = new Date((core.reset||0)*1000).toLocaleTimeString("en-IE",{hour:"2-digit",minute:"2-digit"});
-    const sr = new Date((sms.reset||0)*1000).toLocaleTimeString("en-IE",{hour:"2-digit",minute:"2-digit"});
-    const pct = Math.round(((core.remaining||0)/(core.limit||3600))*100);
-    const status = core.remaining===0?"🚫 EXHAUSTED":core.remaining<100?"🔴 CRITICAL":core.remaining<300?"🟡 LOW":"🟢 OK";
-    const lines = [`DENTALLY API RATE LIMIT`,`${"─".repeat(35)}`,`Status:    ${status}`,`Core API:  ${core.remaining||0} / ${core.limit||3600} remaining (${pct}%)`,`Resets at: ${rt}`,``,`SMS API:   ${sms.remaining||0} / ${sms.limit||300} remaining`,`SMS Reset: ${sr}`];
-    if (core.remaining===0) lines.push(``,`⚠️ All queries blocked until ${rt}. Please wait.`);
+    const results = await Promise.all(TOKENS.map(async (t, i) => {
+      const res = await fetch(DENTALLY_RATE_URL, { headers: { Authorization: `Bearer ${t}`, "User-Agent": "Dentally-MCP-Server v3" } });
+      const data = await res.json();
+      return { token: i+1, core: data.resources?.core||{}, sms: data.resources?.sms||{} };
+    }));
+    const totalR = results.reduce((s,r)=>s+(r.core.remaining||0),0);
+    const totalL = results.reduce((s,r)=>s+(r.core.limit||3600),0);
+    const pct = Math.round((totalR/totalL)*100);
+    const status = totalR===0?"🚫 ALL EXHAUSTED":totalR<200?"🔴 CRITICAL":totalR<600?"🟡 LOW":"🟢 OK";
+    const lines = [`DENTALLY API RATE LIMIT (${TOKENS.length} token${TOKENS.length>1?"s":""})`,`${"─".repeat(40)}`,`Overall Status: ${status}`,`Total Remaining: ${totalR} / ${totalL} (${pct}%)`,``];
+    for (const r of results) {
+      const rt = new Date((r.core.reset||0)*1000).toLocaleTimeString("en-IE",{hour:"2-digit",minute:"2-digit"});
+      lines.push(`Token ${r.token}: ${r.core.remaining||0}/${r.core.limit||3600} remaining — resets ${rt}`);
+    }
+    if(totalR===0) lines.push(``,`⚠️ All tokens exhausted. Please wait.`);
     return { content: [{ type: "text", text: lines.join("\n") }] };
   });
 
