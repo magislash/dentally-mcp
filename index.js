@@ -11,7 +11,8 @@ const PORT = process.env.PORT || 3000;
 const TOKENS = [
   process.env.DENTALLY_API_TOKEN,
   process.env.DENTALLY_API_TOKEN_2,
-].filter(Boolean); // Ignore if Token 2 not set
+  process.env.DENTALLY_API_TOKEN_3,
+].filter(Boolean); // Uses however many tokens are set
 
 let tokenIndex = 0;
 function getNextToken() {
