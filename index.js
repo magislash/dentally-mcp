@@ -2,27 +2,39 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import http from "http";
+import crypto from "crypto";
 
 const DENTALLY_API = "https://api.dentally.co/v1";
 const DENTALLY_RATE_URL = "https://api.dentally.co/rate_limit";
 const PORT = process.env.PORT || 3000;
 
 // Region-based token pools.
-// Each region has up to 3 tokens that are rotated to multiply the Dentally rate limit.
-// Ireland tokens are used by default. UK tokens (Manchester, Leeds, Glasgow) are used
-// only when a tool is called with region:"uk".
+// Each region takes up to 3 tokens, rotated round-robin. Rotation only raises the
+// effective rate limit if the tokens map to SEPARATE Dentally quota buckets — see
+// summarisePool(), which detects a shared bucket and refuses to over-report headroom.
+// Ireland tokens are used by default. UK tokens (Manchester, Leeds, Glasgow,
+// Enniskillen) are used only when a tool is called with region:"uk".
+// Duplicate values are collapsed: the same token pasted into two slots adds nothing.
+const dedupe = (arr) => [...new Set(arr.filter(Boolean).map((t) => t.trim()).filter(Boolean))];
 const TOKEN_POOLS = {
-  ireland: [
+  ireland: dedupe([
     process.env.DENTALLY_API_TOKEN,
     process.env.DENTALLY_API_TOKEN_2,
     process.env.DENTALLY_API_TOKEN_3,
-  ].filter(Boolean),
-  uk: [
+  ]),
+  uk: dedupe([
     process.env.DENTALLY_UK_API_TOKEN,
     process.env.DENTALLY_UK_API_TOKEN_2,
     process.env.DENTALLY_UK_API_TOKEN_3,
-  ].filter(Boolean),
+  ]),
 };
+
+// Env var names for a region, used in error messages so the fix is actionable.
+function envNamesFor(region) {
+  return region === "uk"
+    ? "DENTALLY_UK_API_TOKEN / _2 / _3"
+    : "DENTALLY_API_TOKEN / _2 / _3";
+}
 
 // Pick the pool for a region, falling back to Ireland if UK is not configured.
 function poolFor(region = "ireland") {
@@ -44,6 +56,7 @@ async function dentallyPage(path, region = "ireland") {
   const res = await fetch(`${DENTALLY_API}${path}`, {
     headers: { Authorization: `Bearer ${activeToken}`, "Content-Type": "application/json", "User-Agent": "Dentally-MCP-Server v3" },
   });
+  if (res.status === 401 || res.status === 403) throw new Error(authFailureMessage(region, res.status));
   if (res.status === 429) {
     // Current token exhausted — try another token in the same region's pool if available
     if (pool.length > 1) {
@@ -51,6 +64,7 @@ async function dentallyPage(path, region = "ireland") {
       const res2 = await fetch(`${DENTALLY_API}${path}`, {
         headers: { Authorization: `Bearer ${fallbackToken}`, "Content-Type": "application/json", "User-Agent": "Dentally-MCP-Server v3" },
       });
+      if (res2.status === 401 || res2.status === 403) throw new Error(authFailureMessage(region, res2.status));
       if (!res2.ok) throw new Error(`Dentally API error: ${res2.status} ${res2.statusText}`);
       return res2.json();
     }
@@ -78,34 +92,84 @@ async function dentallyAll(endpoint, params = {}, key, region = "ireland") {
 
 function localeFor(region) { return region === "uk" ? "en-GB" : "en-IE"; }
 
+// A token was rejected outright. Never report this as a rate limit — that conflation
+// is what made an expired-token outage look like an exhausted quota.
+function authFailureMessage(region, status) {
+  return `🔑 DENTALLY AUTH FAILED (${region}, HTTP ${status}) — the token was rejected. ` +
+    `It is invalid, expired, or revoked. This is NOT a rate limit and will not fix itself. ` +
+    `Regenerate the App Token in Dentally and update ${envNamesFor(region)} in the Render environment.`;
+}
+
+// Read one token's quota. Distinguishes auth failure / HTTP error / unreachable from
+// a real "0 remaining", all of which the old code flattened into remaining:0.
+async function readRateLimit(token) {
+  try {
+    const res = await fetch(DENTALLY_RATE_URL, {
+      headers: { Authorization: `Bearer ${token}`, "User-Agent": "Dentally-MCP-Server v3" },
+    });
+    if (res.status === 401 || res.status === 403) return { authError: true, status: res.status };
+    if (!res.ok) return { httpError: `HTTP ${res.status}` };
+    const data = await res.json();
+    const core = data.resources?.core;
+    if (!core || typeof core.remaining !== "number") return { httpError: "no rate_limit payload" };
+    return { remaining: core.remaining, limit: core.limit ?? 0, reset: core.reset ?? 0 };
+  } catch (e) {
+    return { netError: String(e?.message || e) };
+  }
+}
+
+// Combine a pool's readings. Tokens reporting an identical bucket (same limit, reset
+// and remaining) are sharing ONE server-side quota, so summing them would overstate
+// headroom — count each distinct bucket once instead.
+function summarisePool(results) {
+  const live = results.filter((r) => typeof r.remaining === "number");
+  const authFailed = results.length > 0 && results.every((r) => r.authError);
+  if (!live.length) return { usable: false, authFailed, remaining: 0, limit: 0, reset: 0, shared: false };
+  const key = (r) => `${r.limit}:${r.reset}:${r.remaining}`;
+  const buckets = [...new Map(live.map((r) => [key(r), r])).values()];
+  return {
+    usable: true,
+    authFailed: false,
+    remaining: buckets.reduce((sum, r) => sum + r.remaining, 0),
+    limit: buckets.reduce((sum, r) => sum + r.limit, 0),
+    reset: Math.min(...live.map((r) => r.reset)),
+    shared: buckets.length === 1 && live.length > 1,
+    bucketCount: buckets.length,
+  };
+}
+
+function poolBreakdown(results) {
+  return results
+    .map((r, i) => {
+      if (r.authError) return `Token ${i + 1}: AUTH FAILED`;
+      if (typeof r.remaining === "number") return `Token ${i + 1}: ${r.remaining}/${r.limit}`;
+      return `Token ${i + 1}: unavailable`;
+    })
+    .join(" | ");
+}
+
 async function checkRateLimit(region = "ireland") {
   try {
     const pool = poolFor(region);
-    // Check all tokens in this region's pool and combine remaining
-    const results = await Promise.all(pool.map(async (t, i) => {
-      try {
-        const res = await fetch(DENTALLY_RATE_URL, {
-          headers: { Authorization: `Bearer ${t}`, "User-Agent": "Dentally-MCP-Server v3" },
-        });
-        const data = await res.json();
-        const core = data.resources?.core || {};
-        return { token: i+1, remaining: core.remaining || 0, limit: core.limit || 3600, reset: core.reset || 0 };
-      } catch { return { token: i+1, remaining: 0, limit: 3600, reset: 0 }; }
-    }));
+    const results = await Promise.all(pool.map((t) => readRateLimit(t)));
+    const s = summarisePool(results);
+    const breakdown = poolBreakdown(results);
 
-    const totalRemaining = results.reduce((s, r) => s + r.remaining, 0);
-    const totalLimit = results.reduce((s, r) => s + r.limit, 0);
-    const earliestReset = Math.min(...results.map(r => r.reset));
-    const resetTime = new Date(earliestReset * 1000).toLocaleTimeString(localeFor(region), { hour: "2-digit", minute: "2-digit" });
-    const pct = Math.round((totalRemaining / totalLimit) * 100);
+    if (s.authFailed) return { ok: false, warning: `${authFailureMessage(region, 401)} [${breakdown}]` };
+    // Could not read the quota (network blip, unexpected payload) — don't block the query.
+    if (!s.usable) return { ok: true, warning: null };
 
-    const tokenBreakdown = results.map(r => `Token ${r.token}: ${r.remaining}/${r.limit}`).join(" | ");
+    const resetTime = new Date(s.reset * 1000).toLocaleTimeString(localeFor(region), { hour: "2-digit", minute: "2-digit" });
+    const pct = s.limit ? Math.round((s.remaining / s.limit) * 100) : 0;
+    const sharedNote = s.shared ? ` NOTE: these ${results.length} tokens share ONE ${s.limit}/hr quota — they do not multiply it.` : "";
 
-    if (totalRemaining === 0) return { ok: false, warning: `🚫 ALL ${region.toUpperCase()} TOKENS EXHAUSTED — 0/${totalLimit} requests remaining. Resets at ${resetTime}. Please wait.` };
-    if (totalRemaining < 200) return { ok: true, warning: `⚠️ Rate limit CRITICAL (${region}): ${totalRemaining}/${totalLimit} remaining (${pct}%). ${tokenBreakdown}. Resets at ${resetTime}.` };
-    if (totalRemaining < 600) return { ok: true, warning: `⚠️ Rate limit LOW (${region}): ${totalRemaining}/${totalLimit} remaining (${pct}%). ${tokenBreakdown}` };
-    return { ok: true, warning: null, remaining: totalRemaining, limit: totalLimit, footer: `🟢 API (${region}): ${totalRemaining}/${totalLimit} requests left (resets ${resetTime}) [${tokenBreakdown}]` };
-  } catch { return { ok: true, warning: null }; }
+    if (s.remaining === 0) return { ok: false, warning: `🚫 RATE LIMIT EXHAUSTED (${region}) — 0/${s.limit} remaining. Resets at ${resetTime}.${sharedNote}` };
+    if (s.remaining < 200) return { ok: true, warning: `⚠️ Rate limit CRITICAL (${region}): ${s.remaining}/${s.limit} remaining (${pct}%). ${breakdown}. Resets at ${resetTime}.${sharedNote}` };
+    if (s.remaining < 600) return { ok: true, warning: `⚠️ Rate limit LOW (${region}): ${s.remaining}/${s.limit} remaining (${pct}%). ${breakdown}${sharedNote}` };
+    return { ok: true, warning: null, remaining: s.remaining, limit: s.limit, footer: `🟢 API (${region}): ${s.remaining}/${s.limit} requests left (resets ${resetTime})${sharedNote}` };
+  } catch {
+    return { ok: true, warning: null };
+  }
 }
 
 function rlFooter(rl) {
@@ -132,30 +196,57 @@ async function resolveSiteId(siteName, region = "ireland") {
 }
 
 // Shared region parameter description for all tools.
-const REGION_DESC = "Which practice group to query: 'ireland' (default) for the Irish practices, or 'uk' for the UK practices (Manchester, Leeds, Glasgow). Set 'uk' whenever the question is about a UK practice or city.";
+const REGION_DESC = "Which practice group to query: 'ireland' (default) for the Irish practices, or 'uk' for the UK practices (Manchester, Leeds, Glasgow, Enniskillen). Set 'uk' whenever the question is about a UK practice or city.";
 
 function createServer() {
-  const server = new McpServer({ name: "dentally-mcp", version: "3.1.0" });
+  const server = new McpServer({ name: "dentally-mcp", version: "3.2.0" });
 
   server.tool("get_rate_limit_status", "Check Dentally API rate limit status for a region. Run this first if queries are failing. region 'ireland' (default) or 'uk'.",
     { region: z.enum(["ireland","uk"]).optional().describe(REGION_DESC) },
     async ({ region = "ireland" }) => {
       const pool = poolFor(region);
-      const results = await Promise.all(pool.map(async (t, i) => {
-        const res = await fetch(DENTALLY_RATE_URL, { headers: { Authorization: `Bearer ${t}`, "User-Agent": "Dentally-MCP-Server v3" } });
-        const data = await res.json();
-        return { token: i+1, core: data.resources?.core||{}, sms: data.resources?.sms||{} };
-      }));
-      const totalR = results.reduce((s,r)=>s+(r.core.remaining||0),0);
-      const totalL = results.reduce((s,r)=>s+(r.core.limit||3600),0);
-      const pct = Math.round((totalR/totalL)*100);
-      const status = totalR===0?"🚫 ALL EXHAUSTED":totalR<200?"🔴 CRITICAL":totalR<600?"🟡 LOW":"🟢 OK";
-      const lines = [`DENTALLY API RATE LIMIT — ${region.toUpperCase()} (${pool.length} token${pool.length>1?"s":""})`,`${"─".repeat(40)}`,`Overall Status: ${status}`,`Total Remaining: ${totalR} / ${totalL} (${pct}%)`,``];
-      for (const r of results) {
-        const rt = new Date((r.core.reset||0)*1000).toLocaleTimeString(localeFor(region),{hour:"2-digit",minute:"2-digit"});
-        lines.push(`Token ${r.token}: ${r.core.remaining||0}/${r.core.limit||3600} remaining — resets ${rt}`);
+      const results = await Promise.all(pool.map((t) => readRateLimit(t)));
+      const s = summarisePool(results);
+      const lines = [
+        `DENTALLY API RATE LIMIT — ${region.toUpperCase()} (${pool.length} distinct token${pool.length === 1 ? "" : "s"})`,
+        `${"─".repeat(40)}`,
+      ];
+
+      if (!s.usable) {
+        if (s.authFailed) {
+          lines.push(`Overall Status: 🔑 AUTH FAILED`, ``,
+            `Every ${region} token was rejected by Dentally (HTTP 401/403).`,
+            `This is NOT a rate limit — the tokens are invalid, expired or revoked,`,
+            `and waiting will not help.`, ``,
+            `Fix: regenerate the App Tokens in Dentally, then update`,
+            `${envNamesFor(region)} in the Render environment.`);
+        } else {
+          lines.push(`Overall Status: ⚠️ UNAVAILABLE`, ``, `Could not read the rate limit from Dentally.`);
+        }
+        for (const [i, r] of results.entries()) {
+          const why = r.authError ? `AUTH FAILED (HTTP ${r.status})` : r.httpError ? `error: ${r.httpError}` : r.netError ? `unreachable: ${r.netError}` : "unknown";
+          lines.push(`Token ${i + 1}: ${why}`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
       }
-      if(totalR===0) lines.push(``,`⚠️ All ${region} tokens exhausted. Please wait.`);
+
+      const pct = s.limit ? Math.round((s.remaining / s.limit) * 100) : 0;
+      const status = s.remaining === 0 ? "🚫 EXHAUSTED" : s.remaining < 200 ? "🔴 CRITICAL" : s.remaining < 600 ? "🟡 LOW" : "🟢 OK";
+      lines.push(`Overall Status: ${status}`, `Remaining: ${s.remaining} / ${s.limit} (${pct}%)`, ``);
+      for (const [i, r] of results.entries()) {
+        if (r.authError) { lines.push(`Token ${i + 1}: 🔑 AUTH FAILED (HTTP ${r.status})`); continue; }
+        if (typeof r.remaining !== "number") { lines.push(`Token ${i + 1}: ⚠️ unavailable`); continue; }
+        const rt = new Date((r.reset || 0) * 1000).toLocaleTimeString(localeFor(region), { hour: "2-digit", minute: "2-digit" });
+        lines.push(`Token ${i + 1}: ${r.remaining}/${r.limit} remaining — resets ${rt}`);
+      }
+      if (s.shared) {
+        lines.push(``,
+          `⚠️ These ${results.length} tokens report ONE shared quota, not ${results.length} separate ones.`,
+          `   Your effective ceiling is ${s.limit}/hr — rotating them does not raise it.`,
+          `   Either the same token is in more than one slot, or Dentally meters`,
+          `   this quota per account rather than per token.`);
+      }
+      if (s.remaining === 0) lines.push(``, `⚠️ Quota exhausted for ${region}. Wait for the reset shown above.`);
       return { content: [{ type: "text", text: lines.join("\n") }] };
     });
 
@@ -369,17 +460,100 @@ function createServer() {
   return server;
 }
 
+// ---------------------------------------------------------------------------
+// Inbound auth. This endpoint serves patient financial data from a public repo,
+// so /mcp must not be open. Enforced whenever MCP_AUTH_TOKEN is set; when it is
+// unset the server still runs (so a missing var can't lock you out mid-shift)
+// but shouts about it on every start.
+// ---------------------------------------------------------------------------
+const MCP_AUTH_TOKEN = (process.env.MCP_AUTH_TOKEN || "").trim();
+const MAX_BODY_BYTES = 1_000_000;
+
+// Compare hashes so the check is constant-time and length-independent.
+function secretMatches(supplied) {
+  if (!supplied) return false;
+  const a = crypto.createHash("sha256").update(String(supplied)).digest();
+  const b = crypto.createHash("sha256").update(MCP_AUTH_TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Accepts either an Authorization: Bearer header or ?key=<token>, because the
+// Claude connector UI takes a URL and offers nowhere to add a header.
+function isAuthorised(req, url) {
+  if (!MCP_AUTH_TOKEN) return true;
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ") && secretMatches(header.slice(7).trim())) return true;
+  return secretMatches(url.searchParams.get("key"));
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) { reject(new Error("request body too large")); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      catch { reject(new Error("invalid JSON body")); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJsonRpcError(res, httpStatus, code, message, headers = {}) {
+  res.writeHead(httpStatus, { "Content-Type": "application/json", ...headers });
+  res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code, message } }));
+}
+
 const httpServer = http.createServer(async (req, res) => {
-  if (req.method==="GET"&&req.url==="/health") { res.writeHead(200); res.end("OK"); return; }
-  if (req.method==="POST"&&req.url==="/mcp") {
-    const transport=new StreamableHTTPServerTransport({sessionIdGenerator:undefined});
-    const server=createServer();
-    await server.connect(transport);
-    const body=await new Promise(resolve=>{let d="";req.on("data",c=>d+=c);req.on("end",()=>resolve(JSON.parse(d)));});
-    await transport.handleRequest(req,res,body);
+  // Parse the URL so a query string (?key=...) doesn't turn into a 404, which an
+  // exact `req.url === "/mcp"` comparison used to do.
+  let url;
+  try { url = new URL(req.url, `http://${req.headers.host || "localhost"}`); }
+  catch { res.writeHead(400); res.end("Bad request"); return; }
+
+  if (req.method === "GET" && url.pathname === "/health") { res.writeHead(200); res.end("OK"); return; }
+
+  if (req.method === "POST" && url.pathname === "/mcp") {
+    if (!isAuthorised(req, url)) {
+      sendJsonRpcError(res, 401, -32001,
+        "Unauthorized: pass the MCP_AUTH_TOKEN as 'Authorization: Bearer <token>' or append '?key=<token>' to the URL.",
+        { "WWW-Authenticate": 'Bearer realm="dentally-mcp"' });
+      return;
+    }
+
+    let body;
+    try { body = await readJsonBody(req); }
+    catch (e) { sendJsonRpcError(res, 400, -32700, `Parse error: ${e.message}`); return; }
+
+    // Any throw in here used to escape as an unhandled rejection, which can take
+    // the whole process down from a single malformed request.
+    try {
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const server = createServer();
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (e) {
+      console.error("MCP request failed:", e);
+      if (!res.headersSent) sendJsonRpcError(res, 500, -32603, `Internal error: ${e.message}`);
+      else { try { res.end(); } catch {} }
+    }
     return;
   }
+
   res.writeHead(404); res.end("Not found");
 });
 
-httpServer.listen(PORT, () => console.log(`Dentally MCP server v3.1 running on port ${PORT} ✅ (regions: ireland${TOKEN_POOLS.uk.length?" + uk":""})`));
+httpServer.listen(PORT, () => {
+  console.log(`Dentally MCP server v3.2 running on port ${PORT} ✅`);
+  console.log(`  tokens — ireland: ${TOKEN_POOLS.ireland.length} | uk: ${TOKEN_POOLS.uk.length} (duplicates collapsed)`);
+  if (MCP_AUTH_TOKEN) {
+    console.log("  🔒 inbound auth: ENABLED");
+  } else {
+    console.warn("  ⚠️  INBOUND AUTH DISABLED — POST /mcp is PUBLIC and serves patient data.");
+    console.warn("      Set MCP_AUTH_TOKEN in the Render environment to close this.");
+  }
+});
